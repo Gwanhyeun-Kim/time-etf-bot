@@ -1,0 +1,12 @@
+# 상태 & 로그
+state.json
+bot.log
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# OS
+.DS_Store
