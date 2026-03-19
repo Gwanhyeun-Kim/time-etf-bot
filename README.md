@@ -1,47 +1,45 @@
 # TIME ETF 구성종목 변동 알림 봇
 
-이 스크립트는 **TIME ETF 국내 8개** 상품의 구성종목(주식 수량) 변동을 감지하여 **텔레그램으로 알림**을 보냅니다.
+TIME ETF 국내 8개 상품의 구성종목(주식 수량/비중) 변동을 감지하여 **텔레그램으로 알림**을 보냅니다.
 
-## ✅ 준비사항
+## 준비사항
 
-1. **텔레그램 봇 토큰**
-   - `@BotFather`에서 `/newbot` 입력 후 생성
-   - 발급받은 토큰을 `TELEGRAM_BOT_TOKEN` 환경 변수로 설정
-
-2. **알림 받을 채팅 ID**
-   - 본인과의 1:1 대화 ID 또는 그룹 ID를 사용
-   - 봇과 대화를 시작한 후 [@userinfobot](https://t.me/userinfobot) 등으로 `chat_id`를 확인
-   - `TELEGRAM_CHAT_ID` 환경 변수로 설정
-
-3. **Python 환경**
+1. **텔레그램 봇 토큰** — `@BotFather`에서 발급
+2. **알림 받을 채팅 ID** — 봇에 `/start` 메시지 후 확인
+3. **`.env` 파일** 생성:
+   ```
+   TELEGRAM_BOT_TOKEN=your_token
+   TELEGRAM_CHAT_IDS=id1,id2
+   ```
+4. **Python 패키지 설치**:
    ```bash
-   python -m venv .venv
-   source .venv/bin/activate
    pip install -r requirements.txt
    ```
 
-## 🧠 실행 방법
+## 실행 방법
 
-### 1) 1회 실행 (cron / 스케줄러에서 사용)
 ```bash
-python bot.py --mode once
+# 즉시 1회 실행
+python bot.py --now
+
+# chat_id 확인
+python bot.py --get-chatid
 ```
 
-### 2) 지속 실행 (PC 켜져 있는 동안 계속 감시)
-```bash
-python bot.py --mode poll --interval 60
-```
-- `--interval`은 체크 주기(분)입니다.
+## 자동 발송 (macOS LaunchAgent)
 
-## 🔎 업데이트 시점 (예상)
-- 사이트에는 **기준일**만 표시되고 시간이 없으므로 정확한 업데이트 시간은 공개되어 있지 않습니다.
-- 일반적으로 **국내 주식시장 마감 직후(16:00~18:00 KST)**에 데이터가 갱신되는 경우가 많습니다.
-- Cron으로 매일 **18:00~19:00 사이**에 `--mode once`로 실행하도록 설정하면 무난합니다.
+`~/Library/LaunchAgents/com.jason.timeetfbot.plist`로 등록되어 있음.
 
-## 🔧 상태 저장
-- 이전 조회 결과는 `state.json`에 저장됩니다.
-- 다음 실행 시 기존 구성종목 수량과 변동 여부를 비교하여 알림을 보냅니다.
+- **매일 17:40** 자동 실행
+- **맥북 재시작 시** 오늘 미발송이면 로그인 시 자동 실행 (`RunAtLoad`)
+- 중복 발송 방지: `.last_run` 파일로 당일 발송 여부 체크
 
-## ✨ 커스터마이징 아이디어
-- 알림 대상 ETF 목록을 더 추가하거나 제거할 수 있습니다. (`bot.py`의 `ETF_LIST` 수정)
-- 변화가 있는 종목만 정리해 요약 메시지로 발송하도록 포맷을 조정할 수 있습니다.
+## 상태 파일
+
+- `state.json` — 이전 조회 결과 (구성종목 수량/비중)
+- `.last_run` — 마지막 발송 날짜 (중복 방지용)
+- `bot.log` — 실행 로그
+
+## 대상 ETF (8종)
+
+코스닥액티브, Korea플러스배당액티브, 코스피액티브, 코리아밸류업액티브, K신재생에너지액티브, K바이오액티브, K이노베이션액티브, K컬처액티브

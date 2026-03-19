@@ -21,6 +21,16 @@ from datetime import datetime
 import requests
 import schedule
 
+# ── .env 로드 (LaunchAgent에서 bash 없이 직접 실행 시 필요) ────────────
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path, "r") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 # ── 설정 ──────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_IDS = [
@@ -42,7 +52,8 @@ ETF_LIST = [
 
 PAGE_URL = "https://timeetf.co.kr/m11_view.php"
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-REPORT_TIME = "22:00"
+LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_run")
+REPORT_TIME = "17:40"
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -355,9 +366,29 @@ def build_insight(all_diffs_by_etf: dict) -> str:
     return "\n".join(lines)
 
 
+# ── 중복 발송 방지 ────────────────────────────────────────────────────
+def already_sent_today() -> bool:
+    """오늘 이미 리포트를 보냈는지 확인."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if os.path.exists(LAST_RUN_PATH):
+        with open(LAST_RUN_PATH, "r") as f:
+            return f.read().strip() == today
+    return False
+
+
+def mark_sent_today():
+    """오늘 발송 완료 기록."""
+    with open(LAST_RUN_PATH, "w") as f:
+        f.write(datetime.now().strftime("%Y-%m-%d"))
+
+
 # ── 메인 로직 ────────────────────────────────────────────────────────
 def check_and_report():
     """모든 국내 ETF를 체크하고 변동 사항을 텔레그램으로 보고."""
+    if already_sent_today():
+        print(f"[{datetime.now()}] 오늘 이미 발송됨. 스킵.")
+        return
+
     chat_ids = TELEGRAM_CHAT_IDS
 
     state = load_state()
@@ -418,6 +449,7 @@ def check_and_report():
         if insight:
             send_message(cid, insight)
 
+    mark_sent_today()
     print(f"[{datetime.now()}] 리포트 발송 완료")
 
 
