@@ -1,4 +1,4 @@
-"""TIME ETF 국내 8개 구성종목 수량 변동을 매일 17:40에 텔레그램으로 알리는 봇
+"""스탁이지 전략실 + TIME ETF 국내 8개 구성종목 변동을 매일 16:00에 텔레그램으로 알리는 봇
 
 Usage:
   python bot.py --now        # 즉시 1회 실행 (테스트용)
@@ -48,7 +48,10 @@ ETF_LIST = [
 
 PAGE_URL = "https://timeetf.co.kr/m11_view.php"
 LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_run")
-REPORT_TIME = "17:40"
+REPORT_TIME = "16:00"
+
+STOCKEASY_API = "https://stockeasy.intellio.kr/stockdata/api/v1/portfolio"
+STOCKEASY_STRATEGIES = {1: "모멘텀 Easy", 2: "피크 Easy", 3: "밸류 Easy"}
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -483,6 +486,80 @@ def build_weekly_report_from_diffs(all_diffs: dict, date_from: str, date_to: str
     return "\n".join(lines)
 
 
+# ── 스탁이지 리포트 생성 ──────────────────────────────────────────────
+def build_stockeasy_report() -> str:
+    """스탁이지 전략실 3개 전략의 보유종목/편입/편출 리포트 생성."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_display = datetime.now().strftime("%Y.%m.%d")
+    lines = [f"📊 *스탁이지 전략실 일일 리포트* ({today_display})", ""]
+
+    for pid, name in STOCKEASY_STRATEGIES.items():
+        try:
+            r = SESSION.get(f"{STOCKEASY_API}/{pid}/holdings", timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            lines.append(f"━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"*[ {pid}호 - {name} ]*")
+            lines.append(f"데이터 수집 실패: {e}")
+            lines.append("")
+            continue
+
+        holdings = data.get("holdings", {})
+        exits = data.get("exits", {})
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*[ {pid}호 - {name} ]*")
+        lines.append("")
+
+        all_stocks = []
+        for sector, stocks in holdings.items():
+            for s in stocks:
+                all_stocks.append(s)
+
+        new_buys = [s for s in all_stocks if s.get("buy_date", "") == today_str]
+
+        # 전 종목 (수익률 순)
+        sorted_stocks = sorted(all_stocks, key=lambda x: x.get("return_rate", 0), reverse=True)
+        lines.append(f"🏆 보유종목 ({len(all_stocks)}개)")
+        for i, s in enumerate(sorted_stocks, 1):
+            pnl = s.get("return_rate", 0)
+            sign = "+" if pnl > 0 else ""
+            buy_date = s.get("buy_date", "?")[5:]  # MM-DD
+            is_new = " 🆕" if s.get("buy_date", "") == today_str else ""
+            lines.append(f"  {i}. {s['stock_name']} ({s.get('sector', '-')}) {sign}{pnl:.1f}% | 편입 {buy_date}{is_new}")
+        lines.append("")
+
+        # 오늘 편입 요약
+        if new_buys:
+            lines.append(f"🆕 오늘 편입 ({len(new_buys)}건)")
+            for s in new_buys:
+                lines.append(f"  • {s['stock_name']} ({s.get('sector', '-')}) 매수가 {int(s.get('buy_price', 0)):,}원")
+            lines.append("")
+
+        # 오늘 편출
+        exit_list = []
+        for sector, stocks in exits.items():
+            for s in stocks:
+                exit_list.append(s)
+        if exit_list:
+            lines.append(f"❌ 오늘 편출 ({len(exit_list)}건)")
+            for s in exit_list:
+                pnl = s.get("final_return_rate", 0)
+                sign = "+" if pnl > 0 else ""
+                days = s.get("holding_days", "?")
+                buy_p = int(s.get("buy_price", 0))
+                cur_p = int(s.get("current_price", 0))
+                lines.append(f"  • {s['stock_name']} ({s.get('sector', '-')}) {sign}{pnl:.1f}% | {buy_p:,}→{cur_p:,}원 | {days}일 보유")
+            lines.append("")
+
+        if not new_buys and not exit_list:
+            lines.append("변동 없음 ✅")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 # ── 중복 발송 방지 ────────────────────────────────────────────────────
 def already_sent_today() -> bool:
     """오늘 이미 리포트를 보냈는지 확인."""
@@ -519,6 +596,10 @@ def check_and_report():
         print(f"  .env 경로: {_env_path}, 존재: {os.path.exists(_env_path)}")
         return
 
+    # ── 1) 스탁이지 전략실 리포트 ──
+    stockeasy_report = build_stockeasy_report()
+
+    # ── 2) 타임폴리오 ETF 리포트 ──
     today_str = datetime.now().strftime("%Y-%m-%d")
     prev_str = prev_business_day()
     report_parts = []
@@ -560,12 +641,17 @@ def check_and_report():
     part2 = "\n\n".join(report_parts[mid:])
     insight = build_insight(all_diffs_by_etf)
 
-    # 발송 (최대 3회 재시도)
+    # 발송 (최대 3회 재시도): 스탁이지 → 타임폴리오 순서
     MAX_RETRIES = 3
     all_sent = False
     for attempt in range(1, MAX_RETRIES + 1):
         send_ok = True
         for cid in chat_ids:
+            # 스탁이지
+            if not send_message(cid, stockeasy_report):
+                send_ok = False
+                continue
+            # 타임폴리오
             if not send_message(cid, part1):
                 send_ok = False
                 continue
@@ -633,13 +719,7 @@ def main():
 
     # 스케줄 모드
     schedule.every().day.at(args.time).do(check_and_report)
-    print(f"TIME ETF 봇 시작. 매일 {args.time}에 체크합니다. (Ctrl+C로 종료)")
-
-    # 시작 시 초기 데이터 없으면 바로 수집
-    state = load_state()
-    if not any(k for k in state if k != "_chat_id"):
-        print("초기 데이터 수집 중...")
-        check_and_report()
+    print(f"봇 시작. 매일 {args.time}에 체크합니다. (Ctrl+C로 종료)")
 
     while True:
         schedule.run_pending()

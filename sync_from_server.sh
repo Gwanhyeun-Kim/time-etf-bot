@@ -9,8 +9,8 @@ TODAY=$(date '+%Y-%m-%d')
 NOW_HOUR=$(date '+%H')
 NOW_MIN=$(date '+%M')
 
-# 오늘 17:40 이전이면 아직 봇 안 돌았으니 스킵
-if [ "$NOW_HOUR" -lt 17 ] || ([ "$NOW_HOUR" -eq 17 ] && [ "$NOW_MIN" -lt 45 ]); then
+# 오늘 16:00 이전이면 아직 봇 안 돌았으니 스킵
+if [ "$NOW_HOUR" -lt 16 ] || ([ "$NOW_HOUR" -eq 16 ] && [ "$NOW_MIN" -lt 5 ]); then
     exit 0
 fi
 
