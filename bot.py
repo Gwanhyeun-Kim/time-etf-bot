@@ -8,14 +8,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import sys
 import time
-import zipfile
-import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import schedule
@@ -50,8 +47,6 @@ ETF_LIST = [
 ]
 
 PAGE_URL = "https://timeetf.co.kr/m11_view.php"
-STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-WEEKLY_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_weekly.json")
 LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_run")
 REPORT_TIME = "17:40"
 
@@ -140,35 +135,25 @@ def fetch_holdings(idx: int, date: str | None = None) -> list[dict]:
     return parse_holdings_html(r.text)
 
 
-# ── 상태 저장/로드 ───────────────────────────────────────────────────
-def load_state() -> dict:
-    if not os.path.exists(STATE_PATH):
-        return {}
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+# ── 날짜 유틸 ────────────────────────────────────────────────────────
+def prev_business_day(d: datetime = None) -> str:
+    """전 영업일(월~금) 날짜를 'YYYY-MM-DD' 형식으로 반환."""
+    if d is None:
+        d = datetime.now()
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:  # 토(5), 일(6) 건너뛰기
+        d = d - timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
 
 
-def save_state(state: dict):
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-def load_weekly_state() -> dict:
-    if not os.path.exists(WEEKLY_STATE_PATH):
-        return {}
-    try:
-        with open(WEEKLY_STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_weekly_state(state: dict):
-    with open(WEEKLY_STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+def prev_friday(d: datetime = None) -> str:
+    """전주 금요일 날짜를 'YYYY-MM-DD' 형식으로 반환."""
+    if d is None:
+        d = datetime.now()
+    days_since_friday = (d.weekday() - 4) % 7
+    if days_since_friday == 0:
+        days_since_friday = 7  # 오늘이 금요일이면 전주 금요일
+    return (d - timedelta(days=days_since_friday)).strftime("%Y-%m-%d")
 
 
 # ── 변동 비교 ────────────────────────────────────────────────────────
@@ -396,17 +381,8 @@ def build_insight(all_diffs_by_etf: dict) -> str:
 
 
 # ── 주간 리포트 생성 ──────────────────────────────────────────────────
-def build_weekly_report(weekly_state: dict, current_state: dict, date_from: str, date_to: str) -> str:
+def build_weekly_report_from_diffs(all_diffs: dict, date_from: str, date_to: str) -> str:
     """전주 금요일 vs 이번 금요일 비교 주간 리포트 생성."""
-    all_diffs = {}
-    for etf in ETF_LIST:
-        idx_key = str(etf["idx"])
-        old_map = weekly_state.get(idx_key, {})
-        new_list = [{"code": code, **item} for code, item in current_state.get(idx_key, {}).items()]
-        diffs = diff_holdings(old_map, new_list)
-        if diffs:
-            all_diffs[etf["name"]] = diffs
-
     lines = [f"📈 *TIME ETF 주간 리포트* ({date_from} → {date_to})", ""]
     lines.append("이번 한 주도 정말 고생 많으셨어요! ☕")
     lines.append("한 주간 타임폴리오 ETF 움직임을 정리해드립니다.")
@@ -525,7 +501,9 @@ def mark_sent_today():
 
 # ── 메인 로직 ────────────────────────────────────────────────────────
 def check_and_report():
-    """모든 국내 ETF를 체크하고 변동 사항을 텔레그램으로 보고."""
+    """모든 국내 ETF를 체크하고 변동 사항을 텔레그램으로 보고.
+    사이트에서 오늘(D-day)과 전 영업일(D-1) 데이터를 직접 가져와 비교.
+    """
     if datetime.now().weekday() in (5, 6):  # 토/일 스킵
         print(f"[{datetime.now()}] 주말이므로 스킵.")
         return
@@ -541,58 +519,46 @@ def check_and_report():
         print(f"  .env 경로: {_env_path}, 존재: {os.path.exists(_env_path)}")
         return
 
-    state = load_state()
-    new_state = {}
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    prev_str = prev_business_day()
     report_parts = []
-    today = datetime.now().strftime("%Y.%m.%d")
+    today_display = datetime.now().strftime("%Y.%m.%d")
     has_any_data = False
-    first_run = not any(k for k in state if k != "_chat_id")
     has_major_change = False
     all_diffs_by_etf = {}
 
     for etf in ETF_LIST:
-        idx_key = str(etf["idx"])
         try:
-            holdings = fetch_holdings(etf["idx"])
+            holdings_today = fetch_holdings(etf["idx"], today_str)
+            holdings_prev = fetch_holdings(etf["idx"], prev_str)
             has_any_data = True
         except Exception as e:
             print(f"[ERROR] {etf['name']} 데이터 수집 실패: {e}")
-            if idx_key in state:
-                new_state[idx_key] = state[idx_key]
             continue
 
-        new_state[idx_key] = {
-            h["code"]: {"name": h["name"], "quantity": h["quantity"], "weight": h.get("weight", 0.0)}
-            for h in holdings
-        }
-
-        old_holdings = state.get(idx_key, {})
-        diffs = diff_holdings(old_holdings, holdings) if not first_run else {}
+        old_map = {h["code"]: {"name": h["name"], "quantity": h["quantity"], "weight": h.get("weight", 0.0)} for h in holdings_prev}
+        diffs = diff_holdings(old_map, holdings_today)
         if diffs:
             has_major_change = True
             all_diffs_by_etf[etf["name"]] = diffs
 
-        report_parts.append(build_etf_report(etf["name"], holdings, diffs))
-
-    save_state(new_state)
+        report_parts.append(build_etf_report(etf["name"], holdings_today, diffs))
 
     if not has_any_data:
         print(f"[{datetime.now()}] ❌ 데이터 수집 완전 실패. 발송 불가.")
         return
 
-    header = f"📊 *TIME ETF 일일 리포트* ({today})"
+    header = f"📊 *TIME ETF 일일 리포트* ({today_display})"
     if has_major_change:
         header += " | ⚠️ *변동 감지*"
-    elif not first_run:
+    else:
         header += " | 전 종목 변동 없음 ✅"
 
     # 4개씩 나눠서 발송
     mid = len(report_parts) // 2
     part1 = header + "\n\n" + "\n\n".join(report_parts[:mid])
     part2 = "\n\n".join(report_parts[mid:])
-    insight = ""
-    if not first_run:
-        insight = build_insight(all_diffs_by_etf)
+    insight = build_insight(all_diffs_by_etf)
 
     # 발송 (최대 3회 재시도)
     MAX_RETRIES = 3
@@ -619,26 +585,31 @@ def check_and_report():
         mark_sent_today()
         print(f"[{datetime.now()}] ✅ 리포트 발송 완료 (chat_ids: {chat_ids})")
     else:
-        # 발송 실패 — mark 하지 않아서 watchdog이 재시도할 수 있음
         print(f"[{datetime.now()}] ❌ 리포트 발송 최종 실패! 3회 시도 모두 실패.")
         return
 
-    # ── 금요일: 주간 리포트 발송 후 스냅샷 저장 ──
+    # ── 금요일: 주간 리포트 (전주 금요일 vs 이번 금요일 직접 비교) ──
     if datetime.now().weekday() == 4:  # 금요일
-        weekly_state = load_weekly_state()
-        if weekly_state:
-            date_from = weekly_state.get("_date", "?")
-            date_to = datetime.now().strftime("%m.%d")
-            weekly_report = build_weekly_report(weekly_state, new_state, date_from, date_to)
-            for cid in chat_ids:
-                send_message(cid, weekly_report)
-            print(f"[{datetime.now()}] ✅ 주간 리포트 발송 완료")
-        else:
-            print(f"[{datetime.now()}] 주간 리포트: 전주 스냅샷 없음 (다음 주부터 발송)")
+        last_fri = prev_friday()
+        this_fri = today_str
+        weekly_all_diffs = {}
+        for etf in ETF_LIST:
+            try:
+                h_last = fetch_holdings(etf["idx"], last_fri)
+                h_this = fetch_holdings(etf["idx"], this_fri)
+            except Exception:
+                continue
+            old_map = {h["code"]: {"name": h["name"], "quantity": h["quantity"], "weight": h.get("weight", 0.0)} for h in h_last}
+            diffs = diff_holdings(old_map, h_this)
+            if diffs:
+                weekly_all_diffs[etf["name"]] = diffs
 
-        # 이번 금요일 스냅샷 저장
-        new_state["_date"] = datetime.now().strftime("%m.%d")
-        save_weekly_state(new_state)
+        date_from = datetime.strptime(last_fri, "%Y-%m-%d").strftime("%m.%d")
+        date_to = datetime.now().strftime("%m.%d")
+        weekly_report = build_weekly_report_from_diffs(weekly_all_diffs, date_from, date_to)
+        for cid in chat_ids:
+            send_message(cid, weekly_report)
+        print(f"[{datetime.now()}] ✅ 주간 리포트 발송 완료")
 
 
 def main():
