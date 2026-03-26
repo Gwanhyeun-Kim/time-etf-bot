@@ -31,12 +31,14 @@ python bot.py --get-chatid
 `~/Library/LaunchAgents/com.jason.timeetfbot.plist`로 등록되어 있음.
 
 - **매일 17:40** 자동 실행
-- **맥북 재시작 시** 오늘 미발송이면 로그인 시 자동 실행 (`RunAtLoad`)
+- **18:00** watchdog이 미발송 시 재시도
 - 중복 발송 방지: `.last_run` 파일로 당일 발송 여부 체크
+- 실행 경로: `~/time_etf_bot/` (Desktop에서 deploy_and_run.sh가 동기화)
 
 ## 상태 파일
 
 - `state.json` — 이전 조회 결과 (구성종목 수량/비중)
+- `state_weekly.json` — 주간 리포트용 금요일 스냅샷
 - `.last_run` — 마지막 발송 날짜 (중복 방지용)
 - `bot.log` — 실행 로그
 

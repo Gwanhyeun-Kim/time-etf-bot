@@ -1,7 +1,6 @@
-"""TIME ETF 국내 8개 구성종목 수량 변동을 매일 22시에 텔레그램으로 알리는 봇
+"""TIME ETF 국내 8개 구성종목 수량 변동을 매일 17:40에 텔레그램으로 알리는 봇
 
 Usage:
-  python bot.py              # 매일 22:00 스케줄 실행
   python bot.py --now        # 즉시 1회 실행 (테스트용)
   python bot.py --get-chatid # chat_id 확인용
 """
@@ -52,6 +51,7 @@ ETF_LIST = [
 
 PAGE_URL = "https://timeetf.co.kr/m11_view.php"
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+WEEKLY_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_weekly.json")
 LAST_RUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_run")
 REPORT_TIME = "17:40"
 
@@ -156,6 +156,21 @@ def save_state(state: dict):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def load_weekly_state() -> dict:
+    if not os.path.exists(WEEKLY_STATE_PATH):
+        return {}
+    try:
+        with open(WEEKLY_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_weekly_state(state: dict):
+    with open(WEEKLY_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
 # ── 변동 비교 ────────────────────────────────────────────────────────
 def diff_holdings(old: dict, new: list[dict]) -> dict:
     """수량 변동 비교. old: {code: {name, quantity}}, new: [{code, name, quantity}]
@@ -210,12 +225,15 @@ def diff_holdings(old: dict, new: list[dict]) -> dict:
 
 
 # ── 텔레그램 ─────────────────────────────────────────────────────────
-def tg_api(method: str, **kwargs):
-    """텔레그램 Bot API 호출."""
+def tg_api(method: str, **kwargs) -> dict:
+    """텔레그램 Bot API 호출. 응답의 ok 필드까지 검증."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     r = requests.post(url, json=kwargs, timeout=30)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API 실패: {data.get('description', data)}")
+    return data
 
 
 def get_chat_id() -> str | None:
@@ -228,24 +246,35 @@ def get_chat_id() -> str | None:
     return str(msg.get("chat", {}).get("id", ""))
 
 
-def send_message(chat_id: str, text: str):
-    """텔레그램 메시지 전송 (Markdown). 길면 분할 전송."""
+def send_message(chat_id: str, text: str) -> bool:
+    """텔레그램 메시지 전송 (Markdown). 길면 분할 전송. 성공 시 True 반환."""
     MAX_LEN = 4000
-    if len(text) <= MAX_LEN:
-        tg_api("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
-        return
+    try:
+        if len(text) <= MAX_LEN:
+            data = tg_api("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
+            msg_id = data.get("result", {}).get("message_id", "?")
+            print(f"[MSG] chat_id={chat_id} message_id={msg_id}")
+            return True
 
-    # 긴 메시지 분할
-    lines = text.split("\n")
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > MAX_LEN:
-            tg_api("sendMessage", chat_id=chat_id, text=chunk, parse_mode="Markdown")
-            chunk = line + "\n"
-        else:
-            chunk += line + "\n"
-    if chunk.strip():
-        tg_api("sendMessage", chat_id=chat_id, text=chunk, parse_mode="Markdown")
+        # 긴 메시지 분할
+        lines = text.split("\n")
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > MAX_LEN:
+                data = tg_api("sendMessage", chat_id=chat_id, text=chunk, parse_mode="Markdown")
+                msg_id = data.get("result", {}).get("message_id", "?")
+                print(f"[MSG] chat_id={chat_id} message_id={msg_id}")
+                chunk = line + "\n"
+            else:
+                chunk += line + "\n"
+        if chunk.strip():
+            data = tg_api("sendMessage", chat_id=chat_id, text=chunk, parse_mode="Markdown")
+            msg_id = data.get("result", {}).get("message_id", "?")
+            print(f"[MSG] chat_id={chat_id} message_id={msg_id}")
+        return True
+    except Exception as e:
+        print(f"[ERROR] chat_id={chat_id} 메시지 전송 실패: {e}")
+        return False
 
 
 # ── 리포트 생성 ──────────────────────────────────────────────────────
@@ -366,6 +395,118 @@ def build_insight(all_diffs_by_etf: dict) -> str:
     return "\n".join(lines)
 
 
+# ── 주간 리포트 생성 ──────────────────────────────────────────────────
+def build_weekly_report(weekly_state: dict, current_state: dict, date_from: str, date_to: str) -> str:
+    """전주 금요일 vs 이번 금요일 비교 주간 리포트 생성."""
+    all_diffs = {}
+    for etf in ETF_LIST:
+        idx_key = str(etf["idx"])
+        old_map = weekly_state.get(idx_key, {})
+        new_list = [{"code": code, **item} for code, item in current_state.get(idx_key, {}).items()]
+        diffs = diff_holdings(old_map, new_list)
+        if diffs:
+            all_diffs[etf["name"]] = diffs
+
+    lines = [f"📈 *TIME ETF 주간 리포트* ({date_from} → {date_to})", ""]
+    lines.append("이번 한 주도 정말 고생 많으셨어요! ☕")
+    lines.append("한 주간 타임폴리오 ETF 움직임을 정리해드립니다.")
+    lines.append("")
+
+    # 전체 요약
+    total_changes = sum(len(d) for d in all_diffs.values())
+    changed_etfs = len(all_diffs)
+    all_added = []
+    all_removed = []
+    for etf_name, diffs in all_diffs.items():
+        for code, d in diffs.items():
+            if d["status"] == "added":
+                all_added.append({"name": d["name"], "etf": etf_name, "qty": d["new_qty"], "weight": d["new_weight"]})
+            elif d["status"] == "removed":
+                all_removed.append({"name": d["name"], "etf": etf_name, "qty": d["old_qty"], "weight": d["old_weight"]})
+
+    if not all_diffs:
+        lines.append("📊 *주간 요약*: 이번 주 종목 변동이 없었습니다 ✅")
+        lines.append("")
+        lines.append("다음 주도 좋은 한 주 되세요! 💪")
+        return "\n".join(lines)
+
+    lines.append(f"📊 *주간 요약*: {changed_etfs}개 ETF에서 총 {total_changes}건 종목 변동")
+    lines.append(f"  신규 편입 {len(all_added)}건 / 편출 {len(all_removed)}건")
+    lines.append("")
+
+    # 크로스 분석
+    stock_actions = {}
+    for etf_name, diffs in all_diffs.items():
+        for code, d in diffs.items():
+            nm = d["name"]
+            if nm not in stock_actions:
+                stock_actions[nm] = {"etfs": [], "total_delta": 0, "statuses": []}
+            stock_actions[nm]["etfs"].append(etf_name)
+            stock_actions[nm]["total_delta"] += d["delta"]
+            stock_actions[nm]["statuses"].append(d["status"])
+
+    cross_buys = {k: v for k, v in stock_actions.items()
+                  if v["total_delta"] > 0 and (len(v["etfs"]) >= 2 or "added" in v["statuses"])}
+    cross_sells = {k: v for k, v in stock_actions.items()
+                   if v["total_delta"] < 0 and (len(v["etfs"]) >= 2 or "removed" in v["statuses"])}
+
+    if cross_buys:
+        lines.append("🟢 *주간 컨빅션 매수 시그널*")
+        for name, v in sorted(cross_buys.items(), key=lambda t: t[1]["total_delta"], reverse=True):
+            etf_str = ", ".join(v["etfs"])
+            tag = "신규 편입" if "added" in v["statuses"] else "비중 확대"
+            lines.append(f"  • {name}: {tag} (+{v['total_delta']:,}주)")
+            lines.append(f"    → {etf_str}")
+        lines.append("")
+
+    if cross_sells:
+        lines.append("🔴 *주간 컨빅션 매도 시그널*")
+        for name, v in sorted(cross_sells.items(), key=lambda t: t[1]["total_delta"]):
+            etf_str = ", ".join(v["etfs"])
+            tag = "편출" if "removed" in v["statuses"] else "비중 축소"
+            lines.append(f"  • {name}: {tag} ({v['total_delta']:,}주)")
+            lines.append(f"    → {etf_str}")
+        lines.append("")
+
+    # 비중 변화 Top 10
+    weight_changes = []
+    for etf_name, diffs in all_diffs.items():
+        for code, d in diffs.items():
+            w_delta = d["new_weight"] - d["old_weight"]
+            weight_changes.append({
+                "name": d["name"], "etf": etf_name, "w_delta": w_delta,
+                "old_w": d["old_weight"], "new_w": d["new_weight"],
+            })
+    weight_changes.sort(key=lambda x: abs(x["w_delta"]), reverse=True)
+
+    lines.append("⚖️ *주간 비중 변화 Top 10*")
+    for i, wc in enumerate(weight_changes[:10], 1):
+        sign = "+" if wc["w_delta"] > 0 else ""
+        arrow = "🔺" if wc["w_delta"] > 0 else "🔻"
+        lines.append(f"  {i}. {arrow} {wc['name']} ({wc['etf']}) {wc['old_w']:.2f}% → {wc['new_w']:.2f}% ({sign}{wc['w_delta']:.2f}%p)")
+    lines.append("")
+
+    # 편입/편출 (상위 5개 + 외 N건)
+    if all_added:
+        lines.append(f"🆕 *주간 신규 편입* ({len(all_added)}건)")
+        for a in sorted(all_added, key=lambda x: x["weight"], reverse=True)[:5]:
+            lines.append(f"  • {a['name']} → {a['etf']} ({a['qty']:,}주, {a['weight']:.2f}%)")
+        if len(all_added) > 5:
+            lines.append(f"  외 {len(all_added) - 5}건")
+        lines.append("")
+
+    if all_removed:
+        lines.append(f"❌ *주간 편출* ({len(all_removed)}건)")
+        for r in sorted(all_removed, key=lambda x: x["weight"], reverse=True)[:5]:
+            lines.append(f"  • {r['name']} ← {r['etf']} ({r['qty']:,}주, {r['weight']:.2f}%)")
+        if len(all_removed) > 5:
+            lines.append(f"  외 {len(all_removed) - 5}건")
+
+    lines.append("")
+    lines.append("다음 주도 좋은 한 주 되세요! 💪")
+    return "\n".join(lines)
+
+
 # ── 중복 발송 방지 ────────────────────────────────────────────────────
 def already_sent_today() -> bool:
     """오늘 이미 리포트를 보냈는지 확인."""
@@ -385,11 +526,20 @@ def mark_sent_today():
 # ── 메인 로직 ────────────────────────────────────────────────────────
 def check_and_report():
     """모든 국내 ETF를 체크하고 변동 사항을 텔레그램으로 보고."""
+    if datetime.now().weekday() in (5, 6):  # 토/일 스킵
+        print(f"[{datetime.now()}] 주말이므로 스킵.")
+        return
+
     if already_sent_today():
         print(f"[{datetime.now()}] 오늘 이미 발송됨. 스킵.")
         return
 
     chat_ids = TELEGRAM_CHAT_IDS
+    if not chat_ids or not TELEGRAM_BOT_TOKEN:
+        print(f"[{datetime.now()}] ❌ TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_IDS 미설정. .env 파일 확인 필요.")
+        print(f"  BOT_TOKEN 설정됨: {bool(TELEGRAM_BOT_TOKEN)}, CHAT_IDS: {chat_ids}")
+        print(f"  .env 경로: {_env_path}, 존재: {os.path.exists(_env_path)}")
+        return
 
     state = load_state()
     new_state = {}
@@ -427,6 +577,7 @@ def check_and_report():
     save_state(new_state)
 
     if not has_any_data:
+        print(f"[{datetime.now()}] ❌ 데이터 수집 완전 실패. 발송 불가.")
         return
 
     header = f"📊 *TIME ETF 일일 리포트* ({today})"
@@ -443,14 +594,51 @@ def check_and_report():
     if not first_run:
         insight = build_insight(all_diffs_by_etf)
 
-    for cid in chat_ids:
-        send_message(cid, part1)
-        send_message(cid, part2)
-        if insight:
-            send_message(cid, insight)
+    # 발송 (최대 3회 재시도)
+    MAX_RETRIES = 3
+    all_sent = False
+    for attempt in range(1, MAX_RETRIES + 1):
+        send_ok = True
+        for cid in chat_ids:
+            if not send_message(cid, part1):
+                send_ok = False
+                continue
+            if not send_message(cid, part2):
+                send_ok = False
+                continue
+            if insight and not send_message(cid, insight):
+                send_ok = False
+        if send_ok:
+            all_sent = True
+            break
+        print(f"[{datetime.now()}] ⚠️ 발송 실패 (시도 {attempt}/{MAX_RETRIES}). {'재시도...' if attempt < MAX_RETRIES else '최종 실패.'}")
+        if attempt < MAX_RETRIES:
+            time.sleep(10)
 
-    mark_sent_today()
-    print(f"[{datetime.now()}] 리포트 발송 완료")
+    if all_sent:
+        mark_sent_today()
+        print(f"[{datetime.now()}] ✅ 리포트 발송 완료 (chat_ids: {chat_ids})")
+    else:
+        # 발송 실패 — mark 하지 않아서 watchdog이 재시도할 수 있음
+        print(f"[{datetime.now()}] ❌ 리포트 발송 최종 실패! 3회 시도 모두 실패.")
+        return
+
+    # ── 금요일: 주간 리포트 발송 후 스냅샷 저장 ──
+    if datetime.now().weekday() == 4:  # 금요일
+        weekly_state = load_weekly_state()
+        if weekly_state:
+            date_from = weekly_state.get("_date", "?")
+            date_to = datetime.now().strftime("%m.%d")
+            weekly_report = build_weekly_report(weekly_state, new_state, date_from, date_to)
+            for cid in chat_ids:
+                send_message(cid, weekly_report)
+            print(f"[{datetime.now()}] ✅ 주간 리포트 발송 완료")
+        else:
+            print(f"[{datetime.now()}] 주간 리포트: 전주 스냅샷 없음 (다음 주부터 발송)")
+
+        # 이번 금요일 스냅샷 저장
+        new_state["_date"] = datetime.now().strftime("%m.%d")
+        save_weekly_state(new_state)
 
 
 def main():

@@ -1,6 +1,10 @@
 # 상태 & 로그
 state.json
+state_weekly.json
 bot.log
+sync.log
+.last_run
+.last_sync
 
 # Python
 __pycache__/
@@ -10,3 +14,6 @@ venv/
 
 # OS
 .DS_Store
+
+# 메모리 (별도 관리)
+memory/
