@@ -486,7 +486,89 @@ def build_weekly_report_from_diffs(all_diffs: dict, date_from: str, date_to: str
     return "\n".join(lines)
 
 
-# ── 스탁이지 리포트 생성 ──────────────────────────────────────────────
+# ── 스탁이지 스냅샷 저장/로드 ─────────────────────────────────────────
+STOCKEASY_SNAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stockeasy")
+
+
+def fetch_stockeasy_data() -> dict:
+    """스탁이지 3개 전략 데이터를 가져온다."""
+    result = {}
+    for pid, name in STOCKEASY_STRATEGIES.items():
+        r = SESSION.get(f"{STOCKEASY_API}/{pid}/holdings", timeout=30)
+        r.raise_for_status()
+        result[pid] = r.json()
+    return result
+
+
+def save_stockeasy_snapshot(data: dict, date_str: str = None):
+    """스탁이지 데이터를 날짜별 JSON으로 저장."""
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    os.makedirs(STOCKEASY_SNAP_DIR, exist_ok=True)
+    path = os.path.join(STOCKEASY_SNAP_DIR, f"{date_str}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_stockeasy_snapshot(date_str: str) -> dict | None:
+    """날짜별 스탁이지 스냅샷 로드. 없으면 None."""
+    path = os.path.join(STOCKEASY_SNAP_DIR, f"{date_str}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_stockeasy_weekly_report(old_data: dict, new_data: dict, date_from: str, date_to: str) -> str:
+    """스탁이지 주간 리포트: 전주 금요일 vs 이번 금요일 비교."""
+    lines = [f"📈 *스탁이지 전략실 주간 리포트* ({date_from} → {date_to})", ""]
+    lines.append("이번 한 주도 정말 고생 많으셨어요! ☕")
+    lines.append("")
+
+    for pid, name in STOCKEASY_STRATEGIES.items():
+        old = old_data.get(str(pid), old_data.get(pid, {}))
+        new = new_data.get(str(pid), new_data.get(pid, {}))
+
+        old_stocks = {}
+        for sector, stocks in old.get("holdings", {}).items():
+            for s in stocks:
+                old_stocks[s["stock_code"]] = s
+
+        new_stocks = {}
+        for sector, stocks in new.get("holdings", {}).items():
+            for s in stocks:
+                new_stocks[s["stock_code"]] = s
+
+        added = {k: v for k, v in new_stocks.items() if k not in old_stocks}
+        removed = {k: v for k, v in old_stocks.items() if k not in new_stocks}
+        kept = {k: v for k, v in new_stocks.items() if k in old_stocks}
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"*{pid}호 — {name}*")
+        lines.append(f"보유: {len(old_stocks)}개 → {len(new_stocks)}개 | 편입 {len(added)}건 / 편출 {len(removed)}건")
+        lines.append("")
+
+        if added:
+            lines.append(f"🆕 주간 편입 ({len(added)}건)")
+            for code, s in added.items():
+                lines.append(f"  • {s['stock_name']} ({s.get('sector', '-')})")
+            lines.append("")
+
+        if removed:
+            lines.append(f"❌ 주간 편출 ({len(removed)}건)")
+            for code, s in removed.items():
+                lines.append(f"  • {s['stock_name']} ({s.get('sector', '-')})")
+            lines.append("")
+
+        if not added and not removed:
+            lines.append("종목 변동 없음 ✅")
+            lines.append("")
+
+    lines.append("다음 주도 좋은 한 주 되세요! 💪")
+    return "\n".join(lines)
+
+
+# ── 스탁이지 일일 리포트 생성 ─────────────────────────────────────────
 def build_stockeasy_report() -> str:
     """스탁이지 전략실 3개 전략의 보유종목/편입/편출 리포트 생성."""
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -518,16 +600,19 @@ def build_stockeasy_report() -> str:
                 all_stocks.append(s)
 
         new_buys = [s for s in all_stocks if s.get("buy_date", "") == today_str]
+        total_count = len(all_stocks)
 
-        # 전 종목 (수익률 순)
-        sorted_stocks = sorted(all_stocks, key=lambda x: x.get("return_rate", 0), reverse=True)
-        lines.append(f"🏆 보유종목 ({len(all_stocks)}개)")
-        for i, s in enumerate(sorted_stocks, 1):
-            pnl = s.get("return_rate", 0)
-            sign = "+" if pnl > 0 else ""
-            buy_date = s.get("buy_date", "?")[5:]  # MM-DD
-            is_new = " 🆕" if s.get("buy_date", "") == today_str else ""
-            lines.append(f"  {i}. {s['stock_name']} ({s.get('sector', '-')}) {sign}{pnl:.1f}% | 편입 {buy_date}{is_new}")
+        # 섹터별 보유종목
+        lines.append(f"🏆 보유종목 ({total_count}개)")
+        for sector, stocks in holdings.items():
+            sorted_s = sorted(stocks, key=lambda x: x.get("return_rate", 0), reverse=True)
+            lines.append(f"  📁 *{sector}*")
+            for s in sorted_s:
+                pnl = s.get("return_rate", 0)
+                sign = "+" if pnl > 0 else ""
+                buy_date = s.get("buy_date", "?")[5:]
+                is_new = " 🆕" if s.get("buy_date", "") == today_str else ""
+                lines.append(f"    {s['stock_name']} {sign}{pnl:.1f}% | 편입 {buy_date}{is_new}")
         lines.append("")
 
         # 오늘 편입 요약
@@ -596,7 +681,9 @@ def check_and_report():
         print(f"  .env 경로: {_env_path}, 존재: {os.path.exists(_env_path)}")
         return
 
-    # ── 1) 스탁이지 전략실 리포트 ──
+    # ── 1) 스탁이지 전략실 리포트 + 스냅샷 저장 ──
+    stockeasy_data = fetch_stockeasy_data()
+    save_stockeasy_snapshot(stockeasy_data)
     stockeasy_report = build_stockeasy_report()
 
     # ── 2) 타임폴리오 ETF 리포트 ──
@@ -674,8 +761,9 @@ def check_and_report():
         print(f"[{datetime.now()}] ❌ 리포트 발송 최종 실패! 3회 시도 모두 실패.")
         return
 
-    # ── 금요일: 주간 리포트 (전주 금요일 vs 이번 금요일 직접 비교) ──
+    # ── 금요일: 주간 리포트 ──
     if datetime.now().weekday() == 4:  # 금요일
+        # 타임폴리오 주간 리포트
         last_fri = prev_friday()
         this_fri = today_str
         weekly_all_diffs = {}
@@ -695,7 +783,17 @@ def check_and_report():
         weekly_report = build_weekly_report_from_diffs(weekly_all_diffs, date_from, date_to)
         for cid in chat_ids:
             send_message(cid, weekly_report)
-        print(f"[{datetime.now()}] ✅ 주간 리포트 발송 완료")
+        print(f"[{datetime.now()}] ✅ 타임폴리오 주간 리포트 발송 완료")
+
+        # 스탁이지 주간 리포트
+        old_snap = load_stockeasy_snapshot(last_fri)
+        if old_snap:
+            se_weekly = build_stockeasy_weekly_report(old_snap, stockeasy_data, date_from, date_to)
+            for cid in chat_ids:
+                send_message(cid, se_weekly)
+            print(f"[{datetime.now()}] ✅ 스탁이지 주간 리포트 발송 완료")
+        else:
+            print(f"[{datetime.now()}] 스탁이지 주간 리포트: 전주 스냅샷 없음 (다음 주부터 발송)")
 
 
 def main():
